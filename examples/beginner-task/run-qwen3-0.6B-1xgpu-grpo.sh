@@ -80,7 +80,7 @@ ROLLOUT_ARGS=(
     --rm-type math
     --reward-num-workers 8
     --reward-max-concurrency 8
-
+    
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
     --n-samples-per-prompt ${N_SAMPLES}
