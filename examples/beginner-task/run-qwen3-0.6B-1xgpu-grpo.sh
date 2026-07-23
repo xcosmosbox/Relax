@@ -7,7 +7,7 @@
 # Colocate mode: actor and rollout time-share the same GPU.
 #
 # train_iters = NUM_ROLLOUT × ROLLOUT_BATCH_SIZE × N_SAMPLES / GLOBAL_BATCH_SIZE
-#             = 100 × 4 × 4 / 16 = 100 steps
+#             = 10 × 4 × 8 / 16 = 20 optimizer steps
 #
 # Dataset: openai/gsm8k (7473 problems)
 #   Script normalizes the `answer` field (strips CoT, keeps only the number after ####)
@@ -21,7 +21,7 @@
 #   MODEL_DIR  - dir containing Qwen3-0.6B/
 #   DATA_DIR   - dir containing gsm8k/main/train-00000-of-00001.parquet
 #
-# Metrics to watch in ClearML:
+# Metrics to watch in TensorBoard:
 #   rollout/raw_reward   — accuracy 0/1 (expect ~0.5–0.7 initial on GSM8K, rising over training)
 #   train/pg_loss        — policy gradient loss (non-zero and decreasing)
 #   train/grad_norm      — gradient norm (stable, not exploding)
@@ -42,8 +42,8 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/beginner-task}"
-MODEL_DIR="${MODEL_DIR:-/your/model}"
-DATA_DIR="${DATA_DIR:-/your/data}"
+MODEL_DIR="${MODEL_DIR:-/models}"
+DATA_DIR="${DATA_DIR:-/data}"
 
 GSM8K_RAW="${DATA_DIR}/gsm8k/main/train-00000-of-00001.parquet"
 GSM8K_CLEAN="${DATA_DIR}/gsm8k/main/train_clean.parquet"
@@ -57,11 +57,11 @@ print(f"Wrote {len(df)} rows to ${GSM8K_CLEAN}")
 EOF
 fi
 
-NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=10}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:=4}"
 N_SAMPLES="${N_SAMPLES:=8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=16}"
-# train_iters = 100 × 4 × 8 / 16 = 200
+# train_iters = 10 × 4 × 8 / 16 = 20
 
 CKPT_ARGS=(
     --hf-checkpoint ${MODEL_DIR}/Qwen3-0.6B
@@ -78,9 +78,9 @@ ROLLOUT_ARGS=(
     --rollout-shuffle
 
     --rm-type math
-    --reward-num-workers 8
-    --reward-max-concurrency 8
-    
+    --reward-num-workers 1
+    --reward-max-concurrency 2
+
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
     --n-samples-per-prompt ${N_SAMPLES}
@@ -101,15 +101,25 @@ PERF_ARGS=(
 
     --calculate-per-token-loss
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 8192
-    --log-probs-max-tokens-per-gpu 8192
+    --max-tokens-per-gpu 2048
+    --log-probs-max-tokens-per-gpu 2048
+    --log-probs-chunk-size 4
+
+    --update-weight-buffer-size 134217728
+    --train-memory-margin-bytes 536870912
+    --disable-weights-backuper
+
+    --recompute-loss-function
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
 )
 
 GRPO_ARGS=(
     --advantage-estimator grpo
-    --use-kl-loss
-    --kl-loss-coef 0.00
-    --kl-loss-type low_var_kl
+    # --use-kl-loss
+    # --kl-loss-coef 0.00
+    # --kl-loss-type low_var_kl
     --entropy-coef 0.00
     --eps-clip 0.2
 
@@ -132,7 +142,7 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=(
-    --use-clearml
+    # --use-clearml
     --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name qwen3-0.6b-GRPO-gsm8k-1xgpu-${now}
