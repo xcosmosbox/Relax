@@ -142,7 +142,7 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=(
-    # --use-clearml
+    --use-clearml
     --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name qwen3-0.6b-GRPO-gsm8k-1xgpu-${now}
