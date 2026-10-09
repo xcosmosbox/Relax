@@ -133,6 +133,75 @@ def test_all_zero_reward_and_kl_produce_finite_zero_returns():
         assert torch.isfinite(returns).all()
 
 
+def _legacy_loop_returns(reward, token_kl, mask, kl_coef, gamma):
+    """The per-token recurrence that the vectorized implementation replaced."""
+    valid_mask = mask != 0
+    if not torch.any(valid_mask):
+        return torch.zeros_like(token_kl)
+    token_level_rewards = -kl_coef * torch.where(valid_mask, token_kl, torch.zeros_like(token_kl))
+    token_level_rewards[valid_mask.nonzero(as_tuple=True)[0][-1]] += reward
+    returns = torch.zeros_like(token_level_rewards)
+    running = 0.0
+    for t in reversed(range(token_level_rewards.size(0))):
+        running = token_level_rewards[t] + gamma * running
+        returns[t] = running
+    return torch.where(valid_mask, returns, torch.zeros_like(returns))
+
+
+@pytest.mark.parametrize("gamma", [1.0, 0.99, 0.5, 0.0])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_returns_match_reference_on_random_batches(gamma, dtype):
+    generator = torch.Generator().manual_seed(1234)
+    lengths = [1, 2, 7, 128, 129, 300, 0, 5]
+    rewards = torch.randn(len(lengths), generator=generator, dtype=dtype)
+    token_kls, masks = [], []
+    for index, length in enumerate(lengths):
+        token_kls.append(torch.randn(length, generator=generator, dtype=dtype))
+        mask = (torch.rand(length, generator=generator) > 0.2).to(dtype)
+        if index == 3:
+            mask[-17:] = 0  # masked tail: the reward must land on the last valid token
+        if index == 7:
+            mask.zero_()  # fully masked response
+        masks.append(mask)
+
+    actual = get_reinforce_plus_plus_returns(rewards, token_kls, masks, lengths, lengths, kl_coef=0.05, gamma=gamma)
+
+    # Against the float64 reference the result is correctly rounded; the legacy
+    # loop accumulated in the input dtype, so float32 differs by its rounding error.
+    tolerance = 1e-6 if dtype == torch.float32 else 1e-12
+    legacy_tolerance = 1e-4 if dtype == torch.float32 else 1e-12
+    for reward, token_kl, mask, actual_tensor in zip(rewards, token_kls, masks, actual, strict=True):
+        assert actual_tensor.dtype == dtype
+        assert actual_tensor.shape == token_kl.shape
+        expected = _reference_returns(reward.double(), token_kl.double(), mask, 0.05, gamma).to(dtype)
+        torch.testing.assert_close(actual_tensor, expected, atol=tolerance, rtol=tolerance)
+        legacy = _legacy_loop_returns(reward, token_kl, mask, 0.05, gamma)
+        torch.testing.assert_close(actual_tensor, legacy, atol=legacy_tolerance, rtol=legacy_tolerance)
+        assert torch.equal(actual_tensor[mask == 0], torch.zeros_like(actual_tensor[mask == 0]))
+
+
+def test_returns_handle_empty_response():
+    actual = get_reinforce_plus_plus_returns(
+        torch.tensor([3.0]), [torch.zeros(0)], [torch.zeros(0)], [0], [0], 0.1, 1.0
+    )
+    assert actual[0].shape == (0,)
+
+
+def test_reverse_discounted_cumsum_edge_cases():
+    from relax.utils.training.ppo_utils import _reverse_discounted_cumsum
+
+    values = torch.tensor([1.0, 2.0, 3.0])
+    torch.testing.assert_close(_reverse_discounted_cumsum(values, 1.0), torch.tensor([6.0, 5.0, 3.0]))
+    torch.testing.assert_close(_reverse_discounted_cumsum(values, 0.5), torch.tensor([2.75, 3.5, 3.0]))
+    torch.testing.assert_close(_reverse_discounted_cumsum(values, 0.0), values)
+    counts = _reverse_discounted_cumsum(torch.tensor([1, 0, 1, 1, 0], dtype=torch.int32), 1.0)
+    assert counts.dtype == torch.int32
+    assert counts.tolist() == [3, 2, 2, 1, 0]
+    assert _reverse_discounted_cumsum(torch.zeros(0), 0.9).shape == (0,)
+    with pytest.raises(ValueError, match="gamma == 1"):
+        _reverse_discounted_cumsum(torch.ones(2, dtype=torch.int64), 0.9)
+
+
 def test_returns_validate_response_batch_lengths_and_shapes():
     with pytest.raises(ValueError, match="same number of responses"):
         get_reinforce_plus_plus_returns(torch.tensor([0.0, 1.0]), [torch.ones(1)], [torch.ones(1)], [1], [1], 0.1, 1.0)

@@ -707,6 +707,31 @@ def compute_rloo_leave_one_out_rewards(group_rewards: torch.Tensor) -> torch.Ten
     return scale * (group_rewards - mean_reward)
 
 
+def _reverse_discounted_cumsum(values: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Return ``G`` for a 1-D ``values`` where ``G[t] = values[t] + gamma * G[t + 1]``.
+
+    Replaces a per-token Python recurrence, which launches several kernels per
+    token, with a constant number of tensor ops. Floating inputs are accumulated
+    in float64 and cast back, so the result is at least as accurate as the
+    sequential recurrence in the input dtype. Integer inputs require ``gamma == 1``.
+    """
+    if values.numel() == 0:
+        return values.clone()
+    if not values.is_floating_point():
+        if gamma != 1.0:
+            raise ValueError("integer inputs only support gamma == 1")
+        return torch.flip(torch.cumsum(torch.flip(values, dims=(0,)), dim=0), dims=(0,)).to(values.dtype)
+    accum = values.to(torch.float64)
+    if gamma == 1.0:
+        returns = torch.flip(torch.cumsum(torch.flip(accum, dims=(0,)), dim=0), dims=(0,))
+    else:
+        # chunked_gae with zero values and lambda=1 evaluates exactly this recurrence,
+        # with sequential work reduced from T steps to T / chunk_size steps.
+        returns, _ = chunked_gae(accum.unsqueeze(0), torch.zeros_like(accum).unsqueeze(0), gamma=gamma, lambd=1.0)
+        returns = returns.squeeze(0)
+    return returns.to(values.dtype)
+
+
 def get_reinforce_plus_plus_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
@@ -768,29 +793,22 @@ def get_reinforce_plus_plus_returns(
                 f"got {full_kl_response.shape} and {full_mask.shape}."
             )
         valid_mask = full_mask != 0
-        if not torch.any(valid_mask):
-            returns_for_seq = torch.zeros_like(full_kl_response)
-            if cp_size > 1:
-                from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
-
-                returns_for_seq = slice_log_prob_with_cp(returns_for_seq, total_len, response_len)
-            final_returns_chunks.append(returns_for_seq)
-            continue
 
         # Multiplication is insufficient here because NaN * 0 is still NaN.
         # Select valid values before any return arithmetic so masked padding can
         # never contaminate a valid token.
         masked_kl = torch.where(valid_mask, full_kl_response, torch.zeros_like(full_kl_response))
         token_level_rewards = -kl_coef * masked_kl
-        last_idx = valid_mask.nonzero(as_tuple=True)[0][-1]
-        token_level_rewards[last_idx] += rewards[i]
+        # The sequence reward lands on the last valid token. Locate it on device
+        # (a valid token with no valid token after it) instead of nonzero()/any(),
+        # which force a GPU->CPU sync per response. A fully masked response has
+        # no such token and keeps all-zero returns.
+        valid_from_here = _reverse_discounted_cumsum(valid_mask.to(torch.int32), 1.0)
+        is_last_valid = valid_mask & (valid_from_here == 1)
+        token_level_rewards = torch.where(is_last_valid, token_level_rewards + rewards[i], token_level_rewards)
 
-        returns_for_seq = torch.zeros_like(token_level_rewards)
-        running_return = 0.0
-        for t in reversed(range(token_level_rewards.size(0))):
-            # G_t = r_t + gamma * G_{t+1}
-            running_return = token_level_rewards[t] + gamma * running_return
-            returns_for_seq[t] = running_return
+        # G_t = r_t + gamma * G_{t+1}
+        returns_for_seq = _reverse_discounted_cumsum(token_level_rewards, gamma)
         returns_for_seq = torch.where(valid_mask, returns_for_seq, torch.zeros_like(returns_for_seq))
 
         # Step 4: Pick up the results corresponding to our local chunk's parts.
